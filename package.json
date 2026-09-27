@@ -1,0 +1,16 @@
+{
+  "name": "rabbitmq-order-processing",
+  "version": "1.0.0",
+  "description": "Small learning project: RabbitMQ producer/consumer with Express and MongoDB",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "worker": "node worker.js"
+  },
+  "dependencies": {
+    "amqplib": "^0.10.9",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.3",
+    "mongoose": "^8.24.4"
+  }
+}
