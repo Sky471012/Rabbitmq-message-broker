@@ -1,4 +1,4 @@
-require('dotenv').config(true);
+require('dotenv').config();
 
 const express = require('express');
 const connectDB = require('./config/db');
@@ -21,6 +21,8 @@ async function start() {
 }
 
 start().catch((err) => {
-  console.error('Failed to start API server:', err.message);
+  // Node hides connection errors in an AggregateError with an empty message
+  const details = err.errors ? err.errors.map((e) => e.message).join('; ') : err.message;
+  console.error('Failed to start API server:', details || err);
   process.exit(1);
 });

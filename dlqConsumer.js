@@ -35,6 +35,8 @@ async function start() {
 }
 
 start().catch((err) => {
-  console.error('Failed to start DLQ consumer:', err.message);
+  // Node hides connection errors in an AggregateError with an empty message
+  const details = err.errors ? err.errors.map((e) => e.message).join('; ') : err.message;
+  console.error('Failed to start DLQ consumer:', details || err);
   process.exit(1);
 });

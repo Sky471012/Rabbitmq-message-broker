@@ -151,6 +151,8 @@ async function start() {
 }
 
 start().catch((err) => {
-  logError(`Failed to start worker: ${err.message}`);
+  // Node hides connection errors in an AggregateError with an empty message
+  const details = err.errors ? err.errors.map((e) => e.message).join('; ') : err.message;
+  logError(`Failed to start worker: ${details || err}`);
   process.exit(1);
 });
