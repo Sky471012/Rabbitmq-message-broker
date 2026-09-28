@@ -10,7 +10,10 @@ function publishOrderCreated(order) {
     orderId: order._id.toString(),
     customerName: order.customerName,
     items: order.items,
-    total: order.total
+    total: order.total,
+    // Every message starts at 0. Each failed attempt increments this,
+    // until it reaches MAX_RETRIES and the message goes to the DLQ.
+    retryCount: 0
   });
 
   console.log('Publishing order.created');

@@ -11,8 +11,10 @@ A small Node.js project that demonstrates the fundamental **producer → queue �
 - Queues and message persistence
 - Manual acknowledgements (`ack` / `nack`)
 - Decoupling the API from the worker
+- Competing consumers (multiple workers on one queue)
+- Retry limits and a Dead Letter Queue (`orders.dlq`)
 
-**Not included (on purpose):** exchanges, routing keys, dead-letter queues, retries, competing consumers, auth, frontend, Docker, Redis, Kafka.
+**Not included (on purpose):** exchanges, routing keys, retry libraries, exponential backoff, auth, frontend, Docker, Redis, Kafka.
 
 ---
 
@@ -21,10 +23,11 @@ A small Node.js project that demonstrates the fundamental **producer → queue �
 ```
 messageBroker-rabbitmq/
 ├── server.js                 # Express API (producer side)
-├── worker.js                 # RabbitMQ consumer (separate process)
+├── worker.js                 # RabbitMQ consumer (run it 1, 2 or 3 times)
+├── dlqConsumer.js            # Reads and logs dead-lettered messages
 ├── config/
 │   ├── db.js                 # Mongoose connection
-│   └── rabbitmq.js           # RabbitMQ connection + "orders" queue
+│   └── rabbitmq.js           # RabbitMQ connection + "orders" + "orders.dlq"
 ├── models/
 │   └── Order.js              # Order schema
 ├── routes/
@@ -33,7 +36,7 @@ messageBroker-rabbitmq/
 │   └── orderController.js    # validation + response handling
 ├── services/
 │   ├── orderService.js       # MongoDB reads/writes
-│   └── producer.js           # publishes order.created
+│   └── producer.js           # publishes order.created (retryCount: 0)
 ├── package.json
 ├── .env.example
 └── .gitignore
@@ -45,27 +48,14 @@ messageBroker-rabbitmq/
 
 ### 1. Install packages
 
-**Linux / macOS (bash):**
 ```bash
-npm install express mongoose amqplib dotenv
-```
-
-**PowerShell:**
-```powershell
-cd "D:\projects\System Design\messageBroker-rabbitmq"
 npm install express mongoose amqplib dotenv
 ```
 
 ### 2. Create your `.env`
 
-**Linux / macOS:**
 ```bash
 cp .env.example .env
-```
-
-**PowerShell:**
-```powershell
-Copy-Item .env.example .env
 ```
 
 Then edit `.env` and set your real MongoDB Atlas URI:
@@ -96,33 +86,40 @@ Or run it another way (Docker on your machine, etc.) — just make sure `RABBITM
 
 ### 4. Start the processes
 
-You need **three terminals**.
+You need **several terminals**.
 
 **Terminal A — API:**
 ```bash
 npm start
 ```
-```powershell
-npm start
+
+**Terminals B, C, D — Workers (optional but recommended):**
+```bash
+npm run worker      # terminal B
+npm run worker      # terminal C
+npm run worker      # terminal D
 ```
 
-**Terminal B — Worker:**
-```bash
-npm run worker
-```
-```powershell
-npm run worker
-```
+Every worker connects to the **same** `orders` queue — that is the whole point of competing consumers.
 
 Expected logs:
 ```
-API:    MongoDB connected
-        RabbitMQ connected. Queue "orders" is ready
-        API server listening on http://localhost:3000
+API:       MongoDB connected
+           RabbitMQ connected. Queues "orders" and "orders.dlq" are ready
+           API server listening on http://localhost:3000
 
-Worker: MongoDB connected
-        RabbitMQ connected. Queue "orders" is ready
-        Worker started. Waiting for messages on queue "orders"...
+Worker 1:  MongoDB connected
+           RabbitMQ connected. Queues "orders" and "orders.dlq" are ready
+           [Worker 21344] Worker started. Waiting for messages on queue "orders"...
+
+Worker 2:  [Worker 21402] Worker started. Waiting for messages on queue "orders"...
+```
+
+Each worker logs its own process id (`[Worker 21344]`, `[Worker 21402]`, ...) so you can see which one got each message.
+
+**Optional — DLQ consumer (start only when you want to inspect failures):**
+```bash
+npm run dlq
 ```
 
 ---
@@ -209,11 +206,11 @@ Response returned
 
 **Expected worker logs:**
 ```
-Received order.created -> orderId=66f1a2b3c4d5e6f7a8b9c0d1, customer=Alice
-Processing order (simulated slow work, 3 seconds)...
-Order confirmation is being processed...
-Order processed: 66f1a2b3c4d5e6f7a8b9c0d1 status "pending" -> "processed"
-Message acknowledged
+[Worker 21344] Received order.created -> orderId=66f1a2b3c4d5e6f7a8b9c0d1, customer=Alice, attempt=1/3
+[Worker 21344] Processing order (simulated slow work, 3 seconds)...
+[Worker 21344] Order confirmation is being processed...
+[Worker 21344] Order processed: 66f1a2b3c4d5e6f7a8b9c0d1 status "pending" -> "processed"
+[Worker 21344] Message acknowledged
 ```
 
 ---
@@ -319,15 +316,44 @@ Invoke-RestMethod -Uri "http://localhost:3000/orders" -Method Post `
 5. Start the worker again (`npm run worker`).
 6. It immediately receives the pending message and processes it → `"processed"`.
 
-### Experiment 3 — Acknowledgement behaviour (success vs failure)
+### Experiment 3 — Competing consumers (multiple workers)
+
+1. Start **3 workers** in three terminals: `npm run worker` ×3.
+2. POST 3 orders quickly:
+
+**Linux:**
+```bash
+for i in 1 2 3; do
+  curl -X POST http://localhost:3000/orders \
+    -H "Content-Type: application/json" \
+    -d "{\"customerName\":\"Customer $i\",\"items\":[{\"name\":\"Item $i\",\"quantity\":1,\"price\":10}],\"total\":10}"
+done
+```
+
+**PowerShell:**
+```powershell
+1..3 | ForEach-Object {
+  $b = @{
+    customerName = "Customer $_"
+    items = @(@{ name = "Item $_"; quantity = 1; price = 10 })
+    total = 10
+  } | ConvertTo-Json -Depth 5
+  Invoke-RestMethod -Uri "http://localhost:3000/orders" -Method Post `
+    -ContentType "application/json" -Body $b | Out-Null
+}
+```
+
+3. Watch the three terminals: the messages are spread across the workers — RabbitMQ delivers each message to **only one** consumer.
+
+### Experiment 4 — Retry limit + Dead Letter Queue
 
 **Success → ACK:**
 Follow Experiment 1. The worker logs `Message acknowledged` only *after* MongoDB is updated.
 
-**Failure → no ACK → redelivery:**
+**Failure → 3 attempts → `orders.dlq`:**
 
 1. In `.env` set `FAIL_MODE=true`.
-2. Restart the worker (`Ctrl+C`, then `npm run worker`).
+2. Restart **all** workers (`Ctrl+C`, then `npm run worker`).
 3. POST an order.
 
 **Linux:**
@@ -349,15 +375,57 @@ Invoke-RestMethod -Uri "http://localhost:3000/orders" -Method Post `
   -ContentType "application/json" -Body $body3
 ```
 
-4. Worker output:
-```
-Processing failed: Simulated failure (FAIL_MODE=true)
-Message NOT acknowledged - RabbitMQ will redeliver it
-```
-5. The message was **never acked**, so RabbitMQ puts it back on the queue and delivers it again. The order stays `"pending"`.
-6. Set `FAIL_MODE=false`, restart the worker → the redelivered message succeeds → `Message acknowledged` → `"processed"`.
+4. Worker output (note: **any** worker may pick up each retry — that is expected):
 
-> This infinite redelivery loop is intentional for learning. Real systems later add retry limits and dead-letter queues — deliberately out of scope here.
+```
+[Worker 21344] Received order.created -> orderId=... attempt=1/3
+[Worker 21344] Processing order (simulated slow work, 3 seconds)...
+[Worker 21344] Order confirmation is being processed...
+[Worker 21344] Processing failed for order ...: Simulated failure (FAIL_MODE=true)
+[Worker 21344] Retry attempt 1/3 - requeueing message on "orders"
+[Worker 21344] Message requeued for another attempt
+
+[Worker 21402] Received order.created -> orderId=... attempt=2/3
+[Worker 21402] Processing failed for order ...: Simulated failure (FAIL_MODE=true)
+[Worker 21402] Retry attempt 2/3 - requeueing message on "orders"
+[Worker 21402] Message requeued for another attempt
+
+[Worker 21480] Received order.created -> orderId=... attempt=3/3
+[Worker 21480] Processing failed for order ...: Simulated failure (FAIL_MODE=true)
+[Worker 21480] Max retries reached for order ...
+[Worker 21480] Sending message to DLQ
+[Worker 21480] Message moved to orders.dlq
+```
+
+5. The order in MongoDB stays `"status": "pending"` — nothing was processed, but the message did not vanish.
+
+**Inspect the DLQ:**
+
+Start the DLQ consumer in another terminal:
+```bash
+npm run dlq
+```
+
+```
+DLQ consumer started. Waiting for messages on "orders.dlq"...
+DLQ message received
+orderId: 66f1...
+retryCount: 3
+reason: Simulated failure (FAIL_MODE=true)
+customerName: Carol
+```
+
+You can also check the queue without consuming it:
+```bash
+rabbitmqctl list_queues name messages        # Linux
+rabbitmqctl list_queues name messages        # PowerShell
+```
+
+`orders.dlq  1` means one dead-lettered message is waiting.
+
+6. Set `FAIL_MODE=false` and restart the workers — new orders succeed again.
+
+> Note: `npm run dlq` **removes** messages from the DLQ as it logs them (it acks them). Start it only when you want to drain the DLQ.
 
 ---
 
@@ -402,29 +470,39 @@ RabbitMQ keeps the message in the queue (that's Experiment 2). The API still ret
 
 ### 8. What happens when processing fails?
 
-The worker throws **before** calling `ack`. It calls `channel.nack(msg, false, true)` — `requeue: true` — so RabbitMQ puts the message back and redelivers it. Nothing is lost. If we had acked first and then failed, the message would be gone forever. That's the rule: **ack only after successful processing.**
+The worker throws **before** calling `ack`, so RabbitMQ still owns the message. Then `handleFailure()` in `worker.js` decides:
 
-### 9. How is this different from Redis caching?
+- **Attempt 1 or 2 failed** → the worker publishes a *new copy* of the message with `retryCount + 1` back onto `orders`, then acks the old copy. Another worker (maybe a different one) picks it up next.
+- **Attempt 3 failed** → the worker publishes the message to `orders.dlq`, and only **after that publish succeeds** does it ack the original. If the DLQ publish fails, nothing is acked and RabbitMQ redelivers.
 
-| | RabbitMQ (this project) | Redis cache |
-|---|---|---|
-| Goal | Move work between processes | Store data for fast reads |
-| Message lives | Until consumed + acked | Until TTL / eviction |
-| Loss impact | Work never happens | Just a cache miss, DB rebuilds it |
-| Direction | Producer → queue → consumer | App ↔ cache ↔ DB |
-| Semantics | Delivery guarantee | Best-effort speed layer |
+The rule stays the same: **never ack a message before its outcome is safely stored** — either the work is done in MongoDB, or the message is parked in the DLQ.
 
-A cache says *"read this value quickly"*; a queue says *"do this work later, reliably"*. Caching reduces database reads; queuing moves slow work **out** of the request path.
+### 9. Why not just `nack(msg, false, true)` like before?
+
+Because a requeued message comes back **unchanged**. `retryCount` would stay `0` forever and the message would bounce between workers infinitely. To count attempts, the worker must publish a *modified* copy (that carries the new `retryCount`) and then remove the original with an ack. The `retryCount` lives in the message body, so it travels with the message to whichever worker gets it next.
+
+### 10. What is a Dead Letter Queue?
+
+A normal queue used as a "parking lot" for messages that can't be processed. Nothing special is configured — the worker just publishes to `orders.dlq` by name when the retry limit is reached. The value is that the failed message keeps all its data (`orderId`, `items`, `total`, `retryCount`, `error`) instead of being dropped, so you can inspect it later or reprocess it manually.
 
 ---
 
-## Troubleshooting
+## Message flow at a glance
 
-| Symptom | Fix |
-|---|---|
-| `ECONNREFUSED` on 5672 | RabbitMQ isn't running — start the service |
-| `MONGODB_URI is missing` | Create `.env` from `.env.example`, add your Atlas URI |
-| `Authentication failed` | Wrong Atlas user/password, or IP not allowlisted in Atlas |
-| Worker never receives messages | Worker must be running; check it printed `Waiting for messages` |
-| Order stuck at `pending` | Worker crashed or `FAIL_MODE=true` — check worker logs |
-| `EADDRINUSE` on 3000 | Another process uses port 3000 — change `PORT` in `.env` |
+```
+POST /orders
+     |
+     v
+  orders  (retryCount: 0)
+     |
+     +--> W1 / W2 / W3   (whichever is free - competing consumers)
+     |
+     +-- success --> ack --> MongoDB: status = processed   [DONE]
+
+     +-- fail 1 --> retryCount 1 --> back on orders
+     +-- fail 2 --> retryCount 2 --> back on orders
+     +-- fail 3 --> publish to orders.dlq --> ack   [DEAD LETTERED]
+                                                          |
+                                                          v
+                                                    dlqConsumer.js (logs it)
+```
